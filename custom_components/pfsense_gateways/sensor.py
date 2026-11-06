@@ -1,199 +1,132 @@
-"""
-Support for pfsense gateways status monitoring using alexpmorris / pfsense-status-gateways-json script
-Check https://github.com/alexpmorris/pfsense-status-gateways-json on how to install it on pfSense
 
-Copyright (c) 2020 Robert Horvath-Arkosi
+<?php
+/*
+ * pfSense Gateway Status JSON
+ * Based on the original script by Alexander Morris.
+ *
+ * Updated to:
+ * - Support multiple gateways on the same interface
+ * - Use unique gateway names as JSON keys
+ * - Preserve optional interface traffic rates
+ * - Avoid undefined query parameter warnings
+ */
 
-Licensed under MIT. All rights reserved.
+##|+PRIV
+##|*IDENT=page-status-gateways-json
+##|*NAME=Status: Gateways json
+##|*DESCR=Allow access to gateway status data via JSON.
+##|*MATCH=status_gateways_json.php*
+##|-PRIV
 
-https://github.com/nagyrobi/home-assistant-custom-components-pfsense-gateways
-"""
+// CHANGE THIS to your own secret key.
+$secret_key = 'CHANGE_ME';
 
-import asyncio
-import json
-import logging
-from datetime import timedelta
+if (!hash_equals($secret_key, (string) ($_GET['key'] ?? ''))) {
+    http_response_code(403);
+    exit('invalidRequest');
+}
 
-import aiohttp
-import async_timeout
-import homeassistant.helpers.config_validation as cv
-import requests
-import voluptuous as vol
-from homeassistant.components.sensor import PLATFORM_SCHEMA
-from homeassistant.const import (
-    CONF_NAME,
-    CONF_RESOURCE,
-    CONF_VERIFY_SSL,
-    STATE_UNAVAILABLE,
-)
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.helpers.entity import Entity
+require_once('interfaces.inc');
 
-_LOGGER = logging.getLogger(__name__)
+header('Content-Type: application/json; charset=utf-8');
+header('Cache-Control: no-store');
 
-DOMAIN = "pfsense_gateways"
+$include_rates = (($_GET['rates'] ?? '0') === '1');
 
-DEFAULT_NAME = "pfSense gateway"
-DEFAULT_RESOURCE = "http://{0}/status_gateways_json.php?key={1}"
-DEFAULT_KEY = "pfsense"
+$a_gateways = return_gateways_array();
+$gateways_status = return_gateways_status(true);
 
-CONF_HOST = "host"
-CONF_KEY = "key"
-CONF_MONITORED_GATEWAYS = "monitored_gateway_interfaces"
+$pfgateways = array();
 
-SCAN_INTERVAL = timedelta(minutes=2)
+function get_interface_rates($iface)
+{
+    $realif = get_real_interface($iface);
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
-    {
-        vol.Required(CONF_HOST): cv.string,
-        vol.Required(CONF_MONITORED_GATEWAYS): vol.All(cv.ensure_list),
-        vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
-        vol.Optional(CONF_RESOURCE, default=DEFAULT_RESOURCE): cv.string,
-        vol.Optional(CONF_KEY, default=DEFAULT_KEY): cv.string,
+    if (empty($realif)) {
+        return null;
     }
-)
 
+    $before = pfSense_get_interface_stats($realif);
 
-async def async_setup_platform(hass, config, async_add_devices, discovery_info=None):
-    """Set up the pfSense sensor."""
-    name = config.get(CONF_NAME)
-    host = config.get(CONF_HOST)
-    key = config.get(CONF_KEY)
+    $start = microtime(true);
+    usleep(100000);
 
-    resource = config.get(CONF_RESOURCE).format(host, key)
+    $after = pfSense_get_interface_stats($realif);
+    $elapsed = microtime(true) - $start;
 
-    session = async_get_clientsession(hass, False)
-    rest_client = pfSenseClient(session, resource)
+    if ($elapsed <= 0 ||
+        !isset($before['inbytes'], $before['outbytes'],
+               $after['inbytes'], $after['outbytes'])) {
+        return null;
+    }
 
-    devices = []
-    for variable in config[CONF_MONITORED_GATEWAYS]:
-        devices.append(pfSensor(rest_client, name, variable))
+    return array(
+        'inKbps' => abs($after['inbytes'] - $before['inbytes'])
+                    * 8 / $elapsed / 1000,
+        'outKbps' => abs($after['outbytes'] - $before['outbytes'])
+                     * 8 / $elapsed / 1000
+    );
+}
 
-    async_add_devices(devices, True)
+// Preserve the original optional LAN traffic entry.
+if ($include_rates) {
+    $lan_rates = get_interface_rates('lan');
 
+    if ($lan_rates !== null) {
+        $pfgateways['lan'] = array_merge(
+            array('interface' => get_real_interface('lan')),
+            $lan_rates
+        );
+    }
+}
 
-class pfSensor(Entity):
-    """Implementation of a pfSensor sensor."""
+// Process each gateway individually.
+foreach ($gateways_status as $a_gateway) {
 
-    def __init__(self, rest_client, name, if_name):
-        """Initialize the pfSensor sensor."""
-        self.rest_client = rest_client
-        self._name = name
-        self._state = None
-        self.if_name = if_name
-        self.gw_name = None
-        self.monitorip = None
-        self.sourceip = None
-        self.delay = None
-        self.loss = None
-        self.status = None
+    $gwname = $a_gateway['name'] ?? null;
 
-    @property
-    def name(self):
-        """Return the name of the sensor."""
-        return "{0} {1}".format(self._name, self.gw_name)
+    if (empty($gwname) || !isset($a_gateways[$gwname])) {
+        continue;
+    }
 
-    @property
-    def state(self):
-        """Return the state of the device."""
-        return self._state
+    $gateway = $a_gateways[$gwname];
 
-    @property
-    def icon(self):
-        """Icon of the sensor, if class is None."""
-        return "mdi:wan"
+    $iface = $gateway['friendlyiface'] ?? '';
+    $realif = $gateway['interface'] ?? '';
 
-    @property
-    def device_state_attributes(self):
-        attributes = {}
-        attributes["name"] = self.gw_name
-        attributes["friendlyiface"] = self.if_name
-        attributes["sourceip"] = self.sourceip
-        attributes["monitorip"] = self.monitorip
-        attributes["delay"] = self.delay
-        attributes["loss"] = self.loss
-        attributes["status"] = self.status
+    $status = $a_gateway['status'] ?? 'unknown';
 
-        return attributes
+    if ($status === 'none') {
+        $status = 'okay';
+    }
 
-    async def async_update(self):
-        """Get the latest data from REST API and update the state."""
-        try:
-            await self.rest_client.async_update()
-        except:  # pfSenseError:
-            self._state = STATE_UNAVAILABLE
-            self.status = "unavailable"
-            value = None
-            return
-        value = self.rest_client.data
+    // Use the gateway NAME as the unique JSON key.
+    $pfgateways[$gwname] = array(
+        'interface'     => $realif,
+        'friendlyiface' => $iface,
+        'name'          => $gwname,
+        'status'        => $status,
+        'monitorip'     => $a_gateway['monitorip'] ?? '',
+        'sourceip'      => $a_gateway['srcip'] ?? '',
+        'gatewayip'     => $gateway['gateway'] ?? '',
+        'delay'         => $a_gateway['delay'] ?? '',
+        'loss'          => $a_gateway['loss'] ?? ''
+    );
 
-        try:
-            parsed_json = json.loads(value)
-            if not isinstance(parsed_json, dict):
-                _LOGGER.warning("JSON result was not a dictionary")
-                self._state = STATE_UNAVAILABLE
-                self.status = "unavailable"
-                return
-        except ValueError:
-            _LOGGER.warning("REST result could not be parsed as JSON")
-            _LOGGER.debug("Erroneous JSON: %s", value)
-            self._state = STATE_UNAVAILABLE
-            self.status = "unavailable"
-            return
+    if ($include_rates && !empty($iface)) {
+        $rates = get_interface_rates($iface);
 
-        try:
-            self.gw_name = parsed_json[self.if_name]["name"]
-            self.monitorip = parsed_json[self.if_name]["monitorip"]
-            self.sourceip = parsed_json[self.if_name]["sourceip"]
-            self.delay = parsed_json[self.if_name]["delay"]
-            self.loss = parsed_json[self.if_name]["loss"]
-            self.status = parsed_json[self.if_name]["status"]
+        if ($rates !== null) {
+            $pfgateways[$gwname] = array_merge(
+                $pfgateways[$gwname],
+                $rates
+            );
+        }
+    }
+}
 
-            if self.status in ["okay", "delay", "online"]:
-                self._state = True
-            else:
-                self._state = False
-
-        except KeyError:
-            self._state = STATE_UNAVAILABLE
-            self.status = "unavailable"
-
-
-class pfSenseError(Exception):
-    pass
-
-
-class pfSenseClient(object):
-    """Class for handling the data retrieval."""
-
-    def __init__(self, session, resource):
-        """Initialize the data object."""
-        self._session = session
-        self._resource = resource
-        self.data = None
-
-    async def async_update(self):
-        """Get the latest data from pfSense service."""
-        _LOGGER.debug("Get data from %s", str(self._resource))
-        try:
-            with async_timeout.timeout(30):
-                response = await self._session.get(self._resource)
-            self.data = await response.text()
-            _LOGGER.debug("Received data: %s", str(self.data))
-        except aiohttp.ClientError as err:
-            _LOGGER.warning("REST request error: {0}".format(err))
-            self.data = None
-            self._state = STATE_UNAVAILABLE
-            self.status = "unavailable"
-        #            raise pfSenseError
-        except asyncio.TimeoutError:
-            _LOGGER.warning("REST request timeout")
-            self.data = None
-            self._state = STATE_UNAVAILABLE
-            self.status = "unavailable"
-
-
-#            raise pfSenseError
-
-
-## END
+echo json_encode(
+    $pfgateways,
+    JSON_PRETTY_PRINT | JSON_INVALID_UTF8_SUBSTITUTE
+);
+?>
